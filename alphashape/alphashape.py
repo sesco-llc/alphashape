@@ -1,87 +1,22 @@
-"""
-Tools for working with alpha shapes.
-"""
-__all__ = ['alphashape']
-
 import itertools
 import warnings
-from shapely.ops import unary_union, polygonize
-from shapely.geometry import MultiPoint, MultiLineString
-from scipy.spatial import Delaunay
+from typing import Callable
+
 import numpy as np
-from typing import Union, Tuple, List
+import shapely
+import trimesh
+from packaging import version
+from shapely.geometry import MultiLineString, MultiPoint
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import polygonize, unary_union
+from trimesh import Trimesh
 
-try:
-    import geopandas
-    USE_GP = True
-except ImportError:
-    USE_GP = False
+from alphashape.primitives import PointSet, alphasimplices, critical_alphas
 
-
-def circumcenter(points: Union[List[Tuple[float]], np.ndarray]) -> np.ndarray:
-    """
-    Calculate the circumcenter of a set of points in barycentric coordinates.
-
-    Args:
-      points: An `N`x`K` array of points which define an (`N`-1) simplex in K
-        dimensional space.  `N` and `K` must satisfy 1 <= `N` <= `K` and
-        `K` >= 1.
-
-    Returns:
-      The circumcenter of a set of points in barycentric coordinates.
-    """
-    points = np.asarray(points)
-    num_rows, num_columns = points.shape
-    A = np.bmat([[2 * np.dot(points, points.T),
-                  np.ones((num_rows, 1))],
-                 [np.ones((1, num_rows)), np.zeros((1, 1))]])
-    b = np.hstack((np.sum(points * points, axis=1),
-                   np.ones((1))))
-    return np.linalg.solve(A, b)[:-1]
+__all__ = ["alphashape", "optimizealpha", "max_containing_alpha"]
 
 
-def circumradius(points: Union[List[Tuple[float]], np.ndarray]) -> float:
-    """
-    Calculte the circumradius of a given set of points.
-
-    Args:
-      points: An `N`x`K` array of points which define an (`N`-1) simplex in K
-        dimensional space.  `N` and `K` must satisfy 1 <= `N` <= `K` and
-        `K` >= 1.
-
-    Returns:
-      The circumradius of a given set of points.
-    """
-    points = np.asarray(points)
-    return np.linalg.norm(points[0, :] - np.dot(circumcenter(points), points))
-
-
-def alphasimplices(points: Union[List[Tuple[float]], np.ndarray]) -> \
-        Union[List[Tuple[float]], np.ndarray]:
-    """
-    Returns an iterator of simplices and their circumradii of the given set of
-    points.
-
-    Args:
-      points: An `N`x`M` array of points.
-
-    Yields:
-      A simplex, and its circumradius as a tuple.
-    """
-    coords = np.asarray(points)
-    tri = Delaunay(coords)
-
-    for simplex in tri.simplices:
-        simplex_points = coords[simplex]
-        try:
-            yield simplex, circumradius(simplex_points)
-        except np.linalg.LinAlgError:
-            warnings.warn('Singular matrix. Likely caused by all points '
-                          'lying in an N-1 space.')
-
-
-def alphashape(points: Union[List[Tuple[float]], np.ndarray],
-               alpha: Union[None, float] = None):
+def alphashape(points: PointSet, alpha: float | None = None) -> BaseGeometry | Trimesh:
     """
     Compute the alpha shape (concave hull) of a set of points.  If the number
     of points in the input is three or less, the convex hull is returned to the
@@ -100,41 +35,19 @@ def alphashape(points: Union[List[Tuple[float]], np.ndarray],
       ``shapely.geometry.Point`` or ``geopandas.GeoDataFrame``: \
           the resulting geometry
     """
-    # If given a geodataframe, extract the geometry
-    if USE_GP and isinstance(points, geopandas.GeoDataFrame):
-        crs = points.crs
-        points = points['geometry']
-    else:
-        crs = None
-
     # If given a triangle for input, or an alpha value of zero or less,
     # return the convex hull.
-    if len(points) < 4 or (alpha is not None and not callable(
-            alpha) and alpha <= 0):
+    if len(points) < 4 or (alpha is not None and not callable(alpha) and alpha <= 0):
         if not isinstance(points, MultiPoint):
             points = MultiPoint(list(points))
         result = points.convex_hull
-        if crs:
-            gdf = geopandas.GeoDataFrame(geopandas.GeoSeries(result)).rename(
-                columns={0: 'geometry'}).set_geometry('geometry')
-            gdf.crs = crs
-            return gdf
-        else:
-            return result
+        return result
 
     # Determine alpha parameter if one is not given
     if alpha is None:
-        try:
-            from optimizealpha import optimizealpha
-        except ImportError:
-            from .optimizealpha import optimizealpha
         alpha = optimizealpha(points)
 
-    # Convert the points to a numpy array
-    if USE_GP and isinstance(points, geopandas.geoseries.GeoSeries):
-        coords = np.array([point.coords[0] for point in points])
-    else:
-        coords = np.array(points)
+    coords = np.array(points)
 
     # Create a set to hold unique edges of simplices that pass the radius
     # filtering
@@ -158,20 +71,20 @@ def alphashape(points: Union[List[Tuple[float]], np.ndarray],
 
         # Radius filter
         if circumradius < 1.0 / resolved_alpha:
-            for edge in itertools.combinations(
-                    point_indices, r=coords.shape[-1]):
-                if all([e not in edges for e in itertools.combinations(
-                        edge, r=len(edge))]):
+            for edge in itertools.combinations(point_indices, r=coords.shape[-1]):
+                if all(
+                    e not in edges for e in itertools.combinations(edge, r=len(edge))
+                ):
                     edges.add(edge)
                     perimeter_edges.add(edge)
                 else:
-                    perimeter_edges -= set(itertools.combinations(
-                        edge, r=len(edge)))
+                    perimeter_edges -= set(itertools.combinations(edge, r=len(edge)))
 
     if coords.shape[-1] > 3:
         return perimeter_edges
     elif coords.shape[-1] == 3:
         import trimesh
+
         result = trimesh.Trimesh(vertices=coords, faces=list(perimeter_edges))
         trimesh.repair.fix_normals(result)
         return result
@@ -181,11 +94,94 @@ def alphashape(points: Union[List[Tuple[float]], np.ndarray],
     triangles = list(polygonize(m))
     result = unary_union(triangles)
 
-    # Convert to pandas geodataframe object if that is what was an input
-    if crs:
-        gdf = geopandas.GeoDataFrame(geopandas.GeoSeries(result)).rename(
-            columns={0: 'geometry'}).set_geometry('geometry')
-        gdf.crs = crs
-        return gdf
+    return result
+
+
+def optimizealpha(
+    points: PointSet,
+    objective: Callable[[PointSet, float], float] | None = None,
+    lower: float = 0.0,
+    upper: float = np.inf,
+    silent: bool = False,
+    **kwargs,
+) -> float:
+    """
+    Solve for the alpha parameter.
+
+    Attempt to determine the alpha parameter that best wraps the given set of
+    points in one polygon without dropping any points.
+
+    Note:  If the solver fails to find a solution, a value of zero will be
+    returned, which when used with the alphashape function will safely return a
+    convex hull around the points.
+
+    Args:
+
+        points: an iterable container of points
+        max_iterations (int): maximum number of iterations while finding the
+            solution
+        lower: lower limit for optimization
+        upper: upper limit for optimization
+        silent: silence warnings
+
+    Returns:
+
+        float: The optimized alpha parameter
+
+    """
+    if objective is None:
+        objective = max_containing_alpha
+
+    alphas = critical_alphas(points)
+    alphas = alphas[(alphas >= lower) & (alphas <= upper)]
+    if not alphas:
+        if not silent:
+            warnings.warn("No critical alphas within bounds", stacklevel=2)
+        return lower
+
+    best, score = lower, np.inf
+    for alpha in alphas:
+        try:
+            result = objective(points, alpha)
+        except Exception as e:
+            if not silent:
+                warnings.warn(f"Error evaluating alpha {alpha}: {e}", stacklevel=2)
+        else:
+            if result < score:
+                best, score = alpha, result
+    return best
+
+
+def _testalpha(points: PointSet, alpha: float) -> bool:
+    """
+    Evaluates an alpha parameter.
+
+    This helper function creates an alpha shape with the given points and alpha
+    parameter.  It then checks that the produced shape is a Polygon and that it
+    intersects all the input points.
+
+    Args:
+        points: data points
+        alpha: alpha value
+
+    Returns:
+        bool: True if the resulting alpha shape is a single polygon that
+            intersects all the input data points.
+    """
+    polygon = alphashape(points, alpha)
+    if isinstance(polygon, shapely.geometry.polygon.Polygon):
+        if not isinstance(points, MultiPoint):
+            result = MultiPoint(list(points)).geoms
+        else:
+            result = points
+        return all(polygon.intersects(point) for point in result)
+    elif isinstance(polygon, trimesh.base.Trimesh):
+        return len(polygon.faces) > 0 and all(
+            trimesh.proximity.signed_distance(polygon, list(points)) >= 0
+        )
     else:
-        return result
+        return False
+
+
+def max_containing_alpha(points: PointSet, alpha: float) -> float:
+    return -alpha if _testalpha(points, alpha) else np.inf
