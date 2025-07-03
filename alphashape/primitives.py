@@ -80,10 +80,11 @@ def alphasimplices(
 
 
 def critical_alphas(points: PointSet) -> np.ndarray:
+    points = np.asarray(points)
     alphas = set()
     for _, radius in alphasimplices(points):
         if radius > 0:
             alphas.add(1 / radius)
-    alphas = np.array(alphas)
+    alphas = np.array(list(alphas))
     alphas.sort()
     return alphas

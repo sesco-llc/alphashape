@@ -1,6 +1,7 @@
+from functools import partial
 import itertools
 import warnings
-from typing import Callable
+from typing import Callable, Iterable
 
 import numpy as np
 import shapely
@@ -11,12 +12,12 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import polygonize, unary_union
 from trimesh import Trimesh
 
-from alphashape.primitives import PointSet, alphasimplices, critical_alphas
-
-__all__ = ["alphashape", "optimizealpha", "max_containing_alpha"]
+from alphashape.primitives import PointSet, Simplex, alphasimplices, critical_alphas
 
 
-def alphashape(points: PointSet, alpha: float | None = None) -> BaseGeometry | Trimesh:
+def alphashape(
+    points: PointSet, alpha: float | None = None
+) -> BaseGeometry | Trimesh | set[tuple[Simplex, ...]]:
     """
     Compute the alpha shape (concave hull) of a set of points.  If the number
     of points in the input is three or less, the convex hull is returned to the
@@ -39,9 +40,10 @@ def alphashape(points: PointSet, alpha: float | None = None) -> BaseGeometry | T
     # return the convex hull.
     if len(points) < 4 or (alpha is not None and not callable(alpha) and alpha <= 0):
         if not isinstance(points, MultiPoint):
-            points = MultiPoint(list(points))
-        result = points.convex_hull
-        return result
+            result = MultiPoint(list(points))
+        else:
+            result = points
+        return result.convex_hull
 
     # Determine alpha parameter if one is not given
     if alpha is None:
@@ -61,16 +63,17 @@ def alphashape(points: PointSet, alpha: float | None = None) -> BaseGeometry | T
     # will be removed from the `perimeter_edges` set if found there.  This is
     # taking advantage of the property of perimeter edges that each edge can
     # only exist once.
-    perimeter_edges = set()
+    perimeter_edges: set[tuple[Simplex, ...]] = set()
 
     for point_indices, circumradius in alphasimplices(coords):
+        breakpoint()
         if callable(alpha):
-            resolved_alpha = alpha(point_indices, circumradius)
+            resolved = alpha(point_indices, circumradius)
         else:
-            resolved_alpha = alpha
+            resolved = alpha
 
         # Radius filter
-        if circumradius < 1.0 / resolved_alpha:
+        if circumradius < 1.0 / resolved:
             for edge in itertools.combinations(point_indices, r=coords.shape[-1]):
                 if all(
                     e not in edges for e in itertools.combinations(edge, r=len(edge))
@@ -130,58 +133,142 @@ def optimizealpha(
 
     """
     if objective is None:
-        objective = max_containing_alpha
+        objective = max_superset
 
     alphas = critical_alphas(points)
     alphas = alphas[(alphas >= lower) & (alphas <= upper)]
-    if not alphas:
+    if alphas.size == 0:
         if not silent:
             warnings.warn("No critical alphas within bounds", stacklevel=2)
         return lower
 
-    best, score = lower, np.inf
-    for alpha in alphas:
-        try:
-            result = objective(points, alpha)
-        except Exception as e:
-            if not silent:
-                warnings.warn(f"Error evaluating alpha {alpha}: {e}", stacklevel=2)
-        else:
-            if result < score:
-                best, score = alpha, result
-    return best
+    values = _safemap(partial(objective, points), alphas)
+    amin = _argmin(values)
+    if amin is None:
+        if not silent:
+            warnings.warn("No feasible alpha found", stacklevel=2)
+        return lower
+    return alphas[amin]
 
 
-def _testalpha(points: PointSet, alpha: float) -> bool:
+def max_superset(points: PointSet, alpha: float) -> float:
+    """Maximize alpha while containing all points. Expensive but thorough."""
+    return alpha if is_feasible(points, alpha) else -np.inf
+
+
+def max_area(points: PointSet, alpha: float) -> float:
+    """Maximize total area. Fast, good for substantial shapes."""
+    shape = alphashape(points, alpha)
+    try:
+        area = shape.area
+    except AttributeError:
+        # Handle cases where shape does not have an area attribute
+        return -np.inf
+    return area if area > 0 else -np.inf
+
+
+def max_compactness(points: PointSet, alpha: float) -> float:
+    """Maximize area/perimeter² ratio. Prefers compact shapes."""
+    shape = alphashape(points, alpha)
+    try:
+        area = shape.area
+        length = shape.length
+    except AttributeError:
+        # Handle cases where shape does not have area or length attributes
+        return -np.inf
+    if area > 0 and length > 0:
+        return area / length**2
+    return -np.inf
+
+
+def max_nonempty(points: PointSet, alpha: float) -> float:
+    """Simple non-empty check. Fastest option."""
+    shape = alphashape(points, alpha)
+    if hasattr(shape, "is_empty") and not shape.is_empty:
+        return alpha
+    elif isinstance(shape, trimesh.base.Trimesh) and len(shape.faces) > 0:
+        return alpha
+    elif isinstance(shape, set) and len(shape) > 0:
+        return alpha
+    return -np.inf
+
+
+def max_unfragmented(points: PointSet, alpha: float) -> float:
+    """Penalize many components. Good for avoiding fragmentation."""
+    shape = alphashape(points, alpha)
+    if hasattr(shape, "is_empty") and shape.is_empty:
+        return -np.inf
+
+    num_components = len(shape.geoms) if hasattr(shape, "geoms") else 1
+    return alpha - num_components
+
+
+def max_bbox_area(points: PointSet, alpha: float, threshold: float = 0.1) -> float:
+    """Fast area-based selection. Good middle ground."""
+    shape = alphashape(points, alpha)
+    if hasattr(shape, "area") and shape.area > 0:
+        # Require at least 10% of bounding box area
+        bbox = MultiPoint(points).bounds
+        bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+        if shape.area > threshold * bbox_area:
+            return alpha
+    return -np.inf
+
+
+def is_feasible(points: PointSet, alpha: float) -> bool:
     """
-    Evaluates an alpha parameter.
-
-    This helper function creates an alpha shape with the given points and alpha
-    parameter.  It then checks that the produced shape is a Polygon and that it
-    intersects all the input points.
+    Evaluates an alpha parameter for feasibility.
 
     Args:
         points: data points
         alpha: alpha value
-
     Returns:
-        bool: True if the resulting alpha shape is a single polygon that
-            intersects all the input data points.
+        bool: True if the resulting alpha shape intersects all input points.
     """
     polygon = alphashape(points, alpha)
-    if isinstance(polygon, shapely.geometry.polygon.Polygon):
-        if not isinstance(points, MultiPoint):
-            result = MultiPoint(list(points)).geoms
-        else:
-            result = points
-        return all(polygon.intersects(point) for point in result)
-    elif isinstance(polygon, trimesh.base.Trimesh):
-        return len(polygon.faces) > 0 and all(
-            trimesh.proximity.signed_distance(polygon, list(points)) >= 0
-        )
+
+    if not isinstance(points, MultiPoint):
+        point_geoms = MultiPoint(list(points)).geoms
     else:
-        return False
+        point_geoms = points.geoms
+
+    match polygon:
+        case trimesh.base.Trimesh():
+            return len(polygon.faces) > 0 and all(
+                trimesh.proximity.signed_distance(polygon, list(points)) >= 0
+            )
+        case set():
+            return len(polygon) > 0
+        case polygon if hasattr(polygon, "is_empty") and polygon.is_empty:
+            return False
+        case _:  # 2D Shapely geometry
+            return all(polygon.intersects(point) for point in point_geoms)
 
 
-def max_containing_alpha(points: PointSet, alpha: float) -> float:
-    return -alpha if _testalpha(points, alpha) else np.inf
+def _argmin(it: Iterable) -> int:
+    """
+    Returns the index of the minimum value in an iterable.
+
+    Args:
+        it: An iterable containing numerical values.
+
+    Returns:
+        int: The index of the minimum value in the iterable.
+    """
+
+    def second(tup: tuple):
+        return tup[1]
+
+    amin, _ = min(enumerate(it), key=second)
+    return amin
+
+
+def _safemap(f: Callable, it: Iterable) -> Iterable:
+    """
+    Applies a function to each element in an iterable and returns a list of results.
+    """
+    for item in it:
+        try:
+            yield f(item)
+        except Exception as e:
+            warnings.warn(f"Error applying function to item {item}: {e}", stacklevel=2)
