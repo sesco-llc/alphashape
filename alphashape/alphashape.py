@@ -1,12 +1,10 @@
-from functools import partial
 import itertools
 import warnings
+from functools import partial
 from typing import Callable, Iterable
 
 import numpy as np
-import shapely
 import trimesh
-from packaging import version
 from shapely.geometry import MultiLineString, MultiPoint
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import polygonize, unary_union
@@ -71,18 +69,17 @@ def alphashape(
     # only exist once.
     perimeter: set[tuple[Simplex, ...]] = set()
 
-    for point_indices, circumradius in alphasimplices(coords):
-        resolved = alpha(point_indices, circumradius) if callable(alpha) else alpha
+    for simplex, circumradius in alphasimplices(coords):
+        resolved = alpha(simplex, circumradius) if callable(alpha) else alpha
 
         # Radius filter
         if circumradius < 1.0 / resolved:
-            for edge in itertools.combinations(point_indices, r=dim):
-                asdf = itertools.combinations(edge, r=len(edge))
-                if all(e not in edges for e in asdf):
+            for edge in itertools.combinations(simplex, r=dim):
+                if edge not in edges:
                     edges.add(edge)
                     perimeter.add(edge)
                 else:
-                    perimeter -= set(asdf)
+                    perimeter.discard(edge)
 
     if dim == 2:
         # Create the resulting polygon from the edge points
@@ -139,7 +136,7 @@ def optimizealpha(
         return lower
 
     values = _safemap(partial(objective, points), alphas)
-    amin = _argmin(values)
+    amin = _argmax(values)
     if amin is None:
         if not silent:
             warnings.warn("No feasible alpha found", stacklevel=2)
@@ -175,20 +172,6 @@ def is_feasible(points: PointSet, alpha: float) -> bool:
             return False
         case _:  # 2D Shapely geometry
             return all(polygon.covers(point) for point in point_geoms)
-
-
-def polygon_contains_or_intersects(polygon: BaseGeometry, point: BaseGeometry) -> bool:
-    """
-    Check if a polygon contains or touches a point.
-
-    Args:
-        polygon: A polygon geometry.
-        point: A point geometry.
-
-    Returns:
-        bool: True if the polygon contains or intersects the point, False otherwise.
-    """
-    return polygon.contains(point) or polygon.touches(point)
 
 
 def max_superset(points: PointSet, alpha: float) -> float:
@@ -254,7 +237,7 @@ def max_bbox_area(points: PointSet, alpha: float, threshold: float = 0.1) -> flo
     return -np.inf
 
 
-def _argmin(it: Iterable) -> int:
+def _argmax(it: Iterable) -> int:
     """
     Returns the index of the minimum value in an iterable.
 
@@ -268,8 +251,8 @@ def _argmin(it: Iterable) -> int:
     def second(tup: tuple):
         return tup[1]
 
-    amin, _ = min(enumerate(it), key=second)
-    return amin
+    amax, _ = max(enumerate(it), key=second)
+    return amax
 
 
 def _safemap(f: Callable, it: Iterable) -> Iterable:
