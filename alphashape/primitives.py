@@ -9,6 +9,8 @@ PointSet = list[tuple[float, ...]] | np.ndarray
 
 # list of indices of points forming the simplex
 Simplex = list[int] | np.ndarray
+AlphaSimplex = tuple[Simplex, float]
+AlphaSimplices = list[AlphaSimplex]
 
 type AlphaObjective = Callable[[PointSet, float], float]
 
@@ -79,10 +81,9 @@ def alphasimplices(
             )
 
 
-def critical_alphas(points: PointSet) -> np.ndarray:
-    points = np.asarray(points)
+def critical_alphas(simplices: list[AlphaSimplex]) -> np.ndarray:
     alphas = set()
-    for _, radius in alphasimplices(points):
+    for _, radius in simplices:
         if radius > 0:
             alphas.add(1 / radius)
     alphas = np.array(list(alphas))

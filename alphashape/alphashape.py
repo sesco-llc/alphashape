@@ -1,7 +1,7 @@
 import itertools
 import warnings
 from functools import partial
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Protocol
 
 import numpy as np
 import trimesh
@@ -10,11 +10,28 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import polygonize, unary_union
 from trimesh import Trimesh
 
-from alphashape.primitives import PointSet, Simplex, alphasimplices, critical_alphas
+from alphashape.primitives import (
+    AlphaSimplex,
+    PointSet,
+    Simplex,
+    alphasimplices,
+    critical_alphas,
+)
+
+
+class AlphaObjective(Protocol):
+    def __call__(
+        self,
+        points: PointSet,
+        alpha: float,
+        simplices: list[AlphaSimplex] | None = None,
+    ) -> float: ...
 
 
 def alphashape(
-    points: PointSet, alpha: float | None = None
+    points: PointSet,
+    alpha: float | None = None,
+    simplices: list[AlphaSimplex] | None = None,
 ) -> BaseGeometry | Trimesh | set[tuple[Simplex, ...]]:
     """
     Compute the alpha shape (concave hull) of a set of points.  If the number
@@ -53,7 +70,10 @@ def alphashape(
 
     # Determine alpha parameter if one is not given
     if alpha is None:
-        alpha = optimizealpha(points)
+        alpha = optimizealpha(points, simplices=simplices)
+
+    if simplices is None:
+        simplices = list(alphasimplices(coords))
 
     # Create a set to hold unique edges of simplices that pass the radius
     # filtering
@@ -69,7 +89,7 @@ def alphashape(
     # only exist once.
     perimeter: set[tuple[Simplex, ...]] = set()
 
-    for simplex, circumradius in alphasimplices(coords):
+    for simplex, circumradius in simplices:
         resolved = alpha(simplex, circumradius) if callable(alpha) else alpha
 
         # Radius filter
@@ -95,10 +115,11 @@ def alphashape(
 
 def optimizealpha(
     points: PointSet,
-    objective: Callable[[PointSet, float], float] | None = None,
+    objective: AlphaObjective | None = None,
     lower: float = 0.0,
     upper: float = np.inf,
     silent: bool = False,
+    simplices: list[AlphaSimplex] | None = None,
     **kwargs,
 ) -> float:
     """
@@ -125,17 +146,22 @@ def optimizealpha(
         float: The optimized alpha parameter
 
     """
+
+    if simplices is None:
+        coords = np.array(points)
+        simplices = list(alphasimplices(coords))
+
     if objective is None:
         objective = max_superset
 
-    alphas = critical_alphas(points)
+    alphas = critical_alphas(simplices)
     alphas = alphas[(alphas >= lower) & (alphas <= upper)]
     if alphas.size == 0:
         if not silent:
             warnings.warn("No critical alphas within bounds", stacklevel=2)
         return lower
 
-    values = _safemap(partial(objective, points), alphas)
+    values = _safemap(partial(objective, points, simplices=simplices), alphas)
     amin = _argmax(values)
     if amin is None:
         if not silent:
@@ -144,7 +170,9 @@ def optimizealpha(
     return alphas[amin]
 
 
-def is_feasible(points: PointSet, alpha: float) -> bool:
+def is_feasible(
+    points: PointSet, alpha: float, simplices: list[AlphaSimplex] | None = None
+) -> bool:
     """
     Evaluates an alpha parameter for feasibility.
 
@@ -154,7 +182,7 @@ def is_feasible(points: PointSet, alpha: float) -> bool:
     Returns:
         bool: True if the resulting alpha shape intersects all input points.
     """
-    polygon = alphashape(points, alpha)
+    polygon = alphashape(points, alpha, simplices=simplices)
 
     if not isinstance(points, MultiPoint):
         point_geoms = MultiPoint(list(points)).geoms
@@ -174,14 +202,18 @@ def is_feasible(points: PointSet, alpha: float) -> bool:
             return all(polygon.covers(point) for point in point_geoms)
 
 
-def max_superset(points: PointSet, alpha: float) -> float:
+def max_superset(
+    points: PointSet, alpha: float, simplices: list[AlphaSimplex] | None = None
+) -> float:
     """Maximize alpha while containing all points. Expensive but thorough."""
-    return alpha if is_feasible(points, alpha) else -np.inf
+    return alpha if is_feasible(points, alpha, simplices=simplices) else -np.inf
 
 
-def max_area(points: PointSet, alpha: float) -> float:
+def max_area(
+    points: PointSet, alpha: float, simplices: list[AlphaSimplex] | None = None
+) -> float:
     """Maximize total area. Fast, good for substantial shapes."""
-    shape = alphashape(points, alpha)
+    shape = alphashape(points, alpha, simplices=simplices)
     try:
         area = shape.area
     except AttributeError:
@@ -190,9 +222,11 @@ def max_area(points: PointSet, alpha: float) -> float:
     return area if area > 0 else -np.inf
 
 
-def max_compactness(points: PointSet, alpha: float) -> float:
+def max_compactness(
+    points: PointSet, alpha: float, simplices: list[AlphaSimplex] | None = None
+) -> float:
     """Maximize area/perimeter² ratio. Prefers compact shapes."""
-    shape = alphashape(points, alpha)
+    shape = alphashape(points, alpha, simplices=simplices)
     try:
         area = shape.area
         length = shape.length
@@ -204,9 +238,11 @@ def max_compactness(points: PointSet, alpha: float) -> float:
     return -np.inf
 
 
-def max_nonempty(points: PointSet, alpha: float) -> float:
+def max_nonempty(
+    points: PointSet, alpha: float, simplices: list[AlphaSimplex] | None = None
+) -> float:
     """Simple non-empty check. Fastest option."""
-    shape = alphashape(points, alpha)
+    shape = alphashape(points, alpha, simplices=simplices)
     if hasattr(shape, "is_empty") and not shape.is_empty:
         return alpha
     elif isinstance(shape, trimesh.base.Trimesh) and len(shape.faces) > 0:
@@ -216,9 +252,11 @@ def max_nonempty(points: PointSet, alpha: float) -> float:
     return -np.inf
 
 
-def max_unfragmented(points: PointSet, alpha: float) -> float:
+def max_unfragmented(
+    points: PointSet, alpha: float, simplices: list[AlphaSimplex] | None = None
+) -> float:
     """Penalize many components. Good for avoiding fragmentation."""
-    shape = alphashape(points, alpha)
+    shape = alphashape(points, alpha, simplices=simplices)
     if hasattr(shape, "is_empty") and shape.is_empty:
         return -np.inf
 
@@ -226,9 +264,14 @@ def max_unfragmented(points: PointSet, alpha: float) -> float:
     return alpha - num_components
 
 
-def max_bbox_area(points: PointSet, alpha: float, threshold: float = 0.1) -> float:
+def max_bbox_area(
+    points: PointSet,
+    alpha: float,
+    simplices: list[AlphaSimplex] | None = None,
+    threshold: float = 0.1,
+) -> float:
     """Fast area-based selection. Good middle ground."""
-    shape = alphashape(points, alpha)
+    shape = alphashape(points, alpha, simplices=simplices)
     if hasattr(shape, "area") and shape.area > 0:
         bbox = MultiPoint(points).bounds
         bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
