@@ -24,6 +24,8 @@ def alphashape(
     user.  For two points, the convex hull collapses to a `LineString`; for one
     point, a `Point`.
 
+    Supports 2D and 3D point sets
+
     Args:
 
       points (list or ``shapely.geometry.MultiPoint`` or \
@@ -36,20 +38,24 @@ def alphashape(
       ``shapely.geometry.Point`` or ``geopandas.GeoDataFrame``: \
           the resulting geometry
     """
+    coords = np.array(points)
+
+    dim = coords.shape[-1]
+    if dim not in {2, 3}:
+        raise ValueError(f"Unsupported number of dimensions: {dim}. ")
+
     # If given a triangle for input, or an alpha value of zero or less,
     # return the convex hull.
-    if len(points) < 4 or (alpha is not None and not callable(alpha) and alpha <= 0):
+    if len(coords) < 4 or (alpha is not None and not callable(alpha) and alpha <= 0):
         if not isinstance(points, MultiPoint):
-            result = MultiPoint(list(points))
+            result = MultiPoint(list(coords))
         else:
-            result = points
+            result = coords
         return result.convex_hull
 
     # Determine alpha parameter if one is not given
     if alpha is None:
         alpha = optimizealpha(points)
-
-    coords = np.array(points)
 
     # Create a set to hold unique edges of simplices that pass the radius
     # filtering
@@ -63,39 +69,29 @@ def alphashape(
     # will be removed from the `perimeter_edges` set if found there.  This is
     # taking advantage of the property of perimeter edges that each edge can
     # only exist once.
-    perimeter_edges: set[tuple[Simplex, ...]] = set()
+    perimeter: set[tuple[Simplex, ...]] = set()
 
     for point_indices, circumradius in alphasimplices(coords):
-        breakpoint()
-        if callable(alpha):
-            resolved = alpha(point_indices, circumradius)
-        else:
-            resolved = alpha
+        resolved = alpha(point_indices, circumradius) if callable(alpha) else alpha
 
         # Radius filter
         if circumradius < 1.0 / resolved:
-            for edge in itertools.combinations(point_indices, r=coords.shape[-1]):
-                if all(
-                    e not in edges for e in itertools.combinations(edge, r=len(edge))
-                ):
+            for edge in itertools.combinations(point_indices, r=dim):
+                asdf = itertools.combinations(edge, r=len(edge))
+                if all(e not in edges for e in asdf):
                     edges.add(edge)
-                    perimeter_edges.add(edge)
+                    perimeter.add(edge)
                 else:
-                    perimeter_edges -= set(itertools.combinations(edge, r=len(edge)))
+                    perimeter -= set(asdf)
 
-    if coords.shape[-1] > 3:
-        return perimeter_edges
-    elif coords.shape[-1] == 3:
-        import trimesh
-
-        result = trimesh.Trimesh(vertices=coords, faces=list(perimeter_edges))
+    if dim == 2:
+        # Create the resulting polygon from the edge points
+        m = MultiLineString([coords[np.array(edge)] for edge in perimeter])
+        triangles = list(polygonize(m))
+        result = unary_union(triangles)
+    else:
+        result = Trimesh(vertices=coords, faces=list(perimeter))
         trimesh.repair.fix_normals(result)
-        return result
-
-    # Create the resulting polygon from the edge points
-    m = MultiLineString([coords[np.array(edge)] for edge in perimeter_edges])
-    triangles = list(polygonize(m))
-    result = unary_union(triangles)
 
     return result
 
@@ -149,6 +145,50 @@ def optimizealpha(
             warnings.warn("No feasible alpha found", stacklevel=2)
         return lower
     return alphas[amin]
+
+
+def is_feasible(points: PointSet, alpha: float) -> bool:
+    """
+    Evaluates an alpha parameter for feasibility.
+
+    Args:
+        points: data points
+        alpha: alpha value
+    Returns:
+        bool: True if the resulting alpha shape intersects all input points.
+    """
+    polygon = alphashape(points, alpha)
+
+    if not isinstance(points, MultiPoint):
+        point_geoms = MultiPoint(list(points)).geoms
+    else:
+        point_geoms = points.geoms
+
+    match polygon:
+        case trimesh.base.Trimesh():
+            return len(polygon.faces) > 0 and all(
+                trimesh.proximity.signed_distance(polygon, list(points)) >= 0
+            )
+        case set():
+            return len(polygon) > 0
+        case polygon if hasattr(polygon, "is_empty") and polygon.is_empty:
+            return False
+        case _:  # 2D Shapely geometry
+            return all(polygon.covers(point) for point in point_geoms)
+
+
+def polygon_contains_or_intersects(polygon: BaseGeometry, point: BaseGeometry) -> bool:
+    """
+    Check if a polygon contains or touches a point.
+
+    Args:
+        polygon: A polygon geometry.
+        point: A point geometry.
+
+    Returns:
+        bool: True if the polygon contains or intersects the point, False otherwise.
+    """
+    return polygon.contains(point) or polygon.touches(point)
 
 
 def max_superset(points: PointSet, alpha: float) -> float:
@@ -207,42 +247,11 @@ def max_bbox_area(points: PointSet, alpha: float, threshold: float = 0.1) -> flo
     """Fast area-based selection. Good middle ground."""
     shape = alphashape(points, alpha)
     if hasattr(shape, "area") and shape.area > 0:
-        # Require at least 10% of bounding box area
         bbox = MultiPoint(points).bounds
         bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
         if shape.area > threshold * bbox_area:
             return alpha
     return -np.inf
-
-
-def is_feasible(points: PointSet, alpha: float) -> bool:
-    """
-    Evaluates an alpha parameter for feasibility.
-
-    Args:
-        points: data points
-        alpha: alpha value
-    Returns:
-        bool: True if the resulting alpha shape intersects all input points.
-    """
-    polygon = alphashape(points, alpha)
-
-    if not isinstance(points, MultiPoint):
-        point_geoms = MultiPoint(list(points)).geoms
-    else:
-        point_geoms = points.geoms
-
-    match polygon:
-        case trimesh.base.Trimesh():
-            return len(polygon.faces) > 0 and all(
-                trimesh.proximity.signed_distance(polygon, list(points)) >= 0
-            )
-        case set():
-            return len(polygon) > 0
-        case polygon if hasattr(polygon, "is_empty") and polygon.is_empty:
-            return False
-        case _:  # 2D Shapely geometry
-            return all(polygon.intersects(point) for point in point_geoms)
 
 
 def _argmin(it: Iterable) -> int:
